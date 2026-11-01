@@ -1,0 +1,6 @@
+*.exe
+*.zip
+*.wav
+*.dat
+.env
+__pycache__/
