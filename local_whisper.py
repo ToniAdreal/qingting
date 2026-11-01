@@ -21,11 +21,32 @@ def simplified(text):
 
 
 def main():
+    import numpy as np
     from faster_whisper import WhisperModel
     from faster_whisper.audio import decode_audio
-    from faster_whisper.vad import get_speech_timestamps, VadOptions
-    model = WhisperModel("small", device="cpu", compute_type="int8", cpu_threads=6,
+    from faster_whisper.vad import get_speech_timestamps, get_vad_model, VadOptions
+
+    class DictationModel(WhisperModel):
+        # For long recordings, automatic language detection and decoding normally
+        # encode the very same first 30 seconds. Reuse only byte-equivalent input.
+        remember_first = False
+        first_window = None
+
+        def encode(self, features):
+            if self.first_window is not None:
+                original, encoded = self.first_window
+                self.first_window = None
+                if np.array_equal(original, features):
+                    return encoded
+            encoded = super().encode(features)
+            if self.remember_first:
+                self.first_window = (features.copy(), encoded)
+                self.remember_first = False
+            return encoded
+
+    model = DictationModel("small", device="cpu", compute_type="int8", cpu_threads=6,
                          local_files_only=True)
+    get_vad_model()
     for line in sys.stdin.buffer:
         try:
             item = json.loads(line)
@@ -36,6 +57,7 @@ def main():
                 # Gate silence but keep the entire utterance. Trimming individual VAD spans
                 # can discard a short English product name between two Chinese phrases.
                 words = [w.strip() for w in re.split(r"[,，、\r\n]+", item["words"]) if w.strip()]
+                model.remember_first = len(audio) >= 30 * 16000
                 segments, _ = model.transcribe(audio, task="transcribe", beam_size=5,
                     temperature=0.0, hotwords=", ".join(words) or None, condition_on_previous_text=False)
                 text = simplified("".join(s.text for s in segments).strip())
@@ -48,6 +70,9 @@ def main():
             result = {"text": text}
         except Exception:
             result = {"error": "本地模型无法处理这段录音。请重试。"}
+        finally:
+            model.first_window = None
+            model.remember_first = False
         print(json.dumps(result), flush=True)
 
 

@@ -199,6 +199,7 @@ namespace SpaceDictation {
                 retryAudio = null; error = ""; fromKey = keyboard;
                 State("正在聆听", keyboard ? "松开空格完成" : "再点一次完成", coral);
                 recordingTime.Restart(); pulse.Start();
+                if (prefs.UseLocal) local.WarmUp();
             } catch (Exception ex) { EndPasteWatch(); Fail(ex.Message); }
         }
         void EndPasteWatch() {
@@ -208,7 +209,7 @@ namespace SpaceDictation {
         }
         void DropRecorder() {
             pulse.Stop(); fromKey = false; strength = 0; recordingTime.Stop();
-            if (recorder != null) { recorder.Dispose(); recorder = null; }
+            if (recorder != null) { recorder.Dispose(); recorder = null; local.ReleaseWhenIdle(); }
         }
         void FinishRecording() {
             if (recorder == null) return;

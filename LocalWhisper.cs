@@ -38,6 +38,21 @@ namespace SpaceDictation {
                 return worker;
             }
         }
+        public void WarmUp() {
+            // Python loads the model in its own process while the microphone is recording.
+            try { GetWorker(); } catch (Exception) { } // Recognize retries and reports the error with the audio intact.
+        }
+        public void ReleaseWhenIdle() {
+            lock (gate) {
+                if (closed || worker == null) return;
+                if (idle != null) idle.Dispose();
+                Timer lease = null;
+                lease = new Timer(delegate { lock (gate) { if (idle == lease) StopLocked(); } },
+                                  null, Timeout.Infinite, Timeout.Infinite);
+                idle = lease;
+                idle.Change(120000, Timeout.Infinite);
+            }
+        }
         public async Task<string> Recognize(string words, byte[] wave) {
             var json = new JavaScriptSerializer { MaxJsonLength = 32 * 1024 * 1024 };
             Process current = GetWorker();
@@ -54,15 +69,7 @@ namespace SpaceDictation {
                 var reply = json.Deserialize<Dictionary<string, string>>(line);
                 if (reply.ContainsKey("error")) throw new IOException(reply["error"]);
                 string text = reply["text"];
-                lock (gate) {
-                    if (!closed && worker == current) {
-                        Timer lease = null;
-                        lease = new Timer(delegate { lock (gate) { if (idle == lease) StopLocked(); } },
-                                          null, Timeout.Infinite, Timeout.Infinite);
-                        idle = lease;
-                        idle.Change(120000, Timeout.Infinite);
-                    }
-                }
+                ReleaseWhenIdle();
                 return text;
             } catch {
                 lock (gate) { if (worker == current) StopLocked(); }
