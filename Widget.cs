@@ -19,6 +19,9 @@ namespace SpaceDictation {
         readonly Color coral = Color.FromArgb(255, 149, 125);
         readonly Action<string> writeClipboard;
         readonly LocalWhisper local = new LocalWhisper();
+        readonly HistoryStore history;
+        DateTimeOffset recordedAt;
+        Task<PasteTarget> menuOrigin;
         Preferences prefs;
         SpaceKey hook;
         Recorder recorder;
@@ -31,7 +34,8 @@ namespace SpaceDictation {
         PasteGuard pasteGuard;
         Color accent;
         int strength;
-        public Widget(Action<string> writeClipboard = null) {
+        public Widget(Action<string> writeClipboard = null, HistoryStore history = null) {
+            this.history = history ?? new HistoryStore();
             this.writeClipboard = writeClipboard ?? (text => Clipboard.SetDataObject(text, true, 6, 60));
             Text = "轻听 · 空格听写";
             Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
@@ -62,6 +66,7 @@ namespace SpaceDictation {
             };
             menu.Opening += delegate {
                 menu.Items.Clear();
+                Item("听写历史", delegate { OpenHistory(menuOrigin); }, !busy && recorder == null);
                 Item("语音与麦克风设置", OpenSettings, !busy && recorder == null);
                 Item("重试上一段录音", delegate { Submit(retryAudio); }, retryAudio != null && !busy && recorder == null && Ready);
                 if (retryAudio != null) Item("重新录一段", delegate { StartRecording(false); }, !busy && recorder == null && Ready);
@@ -116,14 +121,20 @@ namespace SpaceDictation {
             using (var muted = new SolidBrush(Color.FromArgb(182, 200, 193))) {
                 g.DrawString(title, heading, light, 61, 12);
                 g.DrawString(hint, caption, muted, 61, 33);
+                using (var clockPen = new Pen(Color.FromArgb(182,200,193), 1.5f)) {
+                    g.DrawEllipse(clockPen, 199, 23, 14, 14);
+                    g.DrawLines(clockPen, new[] { new Point(206,26), new Point(206,30), new Point(210,32) });
+                }
                 for (int i = 0; i < 3; i++) g.FillEllipse(muted, 228, 22 + 6*i, 3, 3);
             }
         }
         protected override void OnMouseDown(MouseEventArgs e) {
             base.OnMouseDown(e);
-            if (e.Button == MouseButtons.Right || (e.Button == MouseButtons.Left && e.X >= 212*scale)) {
+            if (e.Button == MouseButtons.Right || (e.Button == MouseButtons.Left && e.X >= 218*scale)) {
+                menuOrigin = PasteTarget.Capture(true);
                 menu.Show(this, e.Location); return;
             }
+            if (e.Button == MouseButtons.Left && e.X >= 190*scale) { OpenHistory(PasteTarget.Capture(true)); return; }
             if (e.Button != MouseButtons.Left) return;
             pressed = true; dragging = false; origin = Location; mouseOrigin = Cursor.Position; Capture = true;
         }
@@ -156,13 +167,35 @@ namespace SpaceDictation {
             if (retryAudio != null && Ready) State("上一段录音   /   点此重试", "也可长按空格录新的一段", mint);
             else Idle();
         }
+        async void OpenHistory(Task<PasteTarget> origin) {
+            if (busy || recorder != null || settingsOpen) return;
+            settingsOpen = true;
+            try {
+                PasteTarget destination = null;
+                if (origin != null && await Task.WhenAny(origin, Task.Delay(900)) == origin) destination = await origin;
+                if (closing) return;
+                using (var dialog = new HistoryWindow(history, destination != null)) {
+                    if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                    writeClipboard(dialog.PasteText);
+                    var sequence = PasteTarget.GetClipboardSequenceNumber();
+                    State("历史全文已复制", "可按 Ctrl + V 粘贴", mint);
+                    if (destination == null || !destination.RestoreWindow()) return;
+                    pasteGuard = new PasteGuard();
+                    await Task.Delay(120);
+                    if (await PasteTarget.PasteIfCurrent(origin, sequence, () => pasteGuard != null && pasteGuard.Untouched, dialog.PasteText))
+                        State("历史全文已粘贴", "检查文字后发送", mint);
+                }
+            } catch (Exception ex) { error = "历史记录操作失败。" + ex.Message; State("历史操作失败", "点菜单查看提示", coral); }
+            finally { EndPasteWatch(); settingsOpen = false; }
+        }
         void StartRecording(bool keyboard) {
             if (busy || recorder != null || settingsOpen || !Ready || closing) return;
             try {
                 EndPasteWatch();
                 if (keyboard && prefs.AutoPaste) pasteGuard = new PasteGuard();
-                pasteTarget = keyboard && prefs.AutoPaste ? PasteTarget.Capture() : null;
+                pasteTarget = keyboard && prefs.AutoPaste ? PasteTarget.Capture(true) : null;
                 recorder = new Recorder(prefs.Device);
+                recordedAt = DateTimeOffset.Now;
                 retryAudio = null; error = ""; fromKey = keyboard;
                 State("正在聆听", keyboard ? "松开空格完成" : "再点一次完成", coral);
                 recordingTime.Restart(); pulse.Start();
@@ -198,9 +231,17 @@ namespace SpaceDictation {
                 retryAudio = null;
                 if (String.IsNullOrWhiteSpace(text)) { State("没有听清", "请检查麦克风，再说一次", coral); return; }
                 lastText = text;
-                if (CopyLast() && destination != null &&
-                    await PasteTarget.PasteIfCurrent(destination, PasteTarget.GetClipboardSequenceNumber(), () => pasteGuard != null && pasteGuard.Untouched, text) && !closing)
-                    State("已复制   /   已触发粘贴", "检查输入框里的文字后发送", mint);
+                string saveError = null;
+                try { history.Add(recordedAt == default(DateTimeOffset) ? DateTimeOffset.Now : recordedAt, text); }
+                catch (Exception ex) { saveError = "历史记录未写入。" + ex.Message; }
+                if (CopyLast() && destination != null) {
+                    bool pasted = await PasteTarget.PasteIfCurrent(destination, PasteTarget.GetClipboardSequenceNumber(), () => pasteGuard != null && pasteGuard.Untouched, text);
+                    if (!closing) {
+                        if (pasted) State("已复制   /   已触发粘贴", "检查输入框里的文字后发送", mint);
+                        else State("已复制   /   Ctrl + V", PasteTarget.LastReason, mint);
+                    }
+                }
+                if (saveError != null && !closing) { error = saveError; State("未能保存历史", "点菜单查看提示", coral); }
             } catch (UnauthorizedAccessException ex) {
                 if (!closing && prefs.UseLocal) Fail(ex.Message);
                 else if (!closing) { error = ex.Message; State("豆包模型未开通", "点此切换本地或查看设置", coral); }
