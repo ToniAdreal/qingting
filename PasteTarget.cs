@@ -1,10 +1,36 @@
 using System;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Automation;
 
 namespace SpaceDictation {
+    internal sealed class PasteGuard : IDisposable {
+        delegate IntPtr MouseProc(int code, IntPtr message, IntPtr data);
+        [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int id, MouseProc callback, IntPtr module, uint thread);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string name);
+        [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hook);
+        [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr message, IntPtr data);
+        readonly MouseProc callback;
+        IntPtr hook;
+        public bool Untouched { get; private set; }
+        public PasteGuard() {
+            callback = delegate(int code, IntPtr message, IntPtr data) {
+                if (code >= 0 && message.ToInt32() != 0x200) Cancel(); // Mouse movement alone is harmless.
+                return CallNextHookEx(hook, code, message, data);
+            };
+            hook = SetWindowsHookEx(14, callback, GetModuleHandle(null), 0);
+            Untouched = hook != IntPtr.Zero;
+        }
+        public void Cancel() { Untouched = false; }
+        public void Dispose() {
+            Cancel();
+            if (hook != IntPtr.Zero) UnhookWindowsHookEx(hook);
+            hook = IntPtr.Zero;
+        }
+    }
+
     // A web page may put several editors behind the same HWND. Match the focused
     // accessibility element too. We never read the field's text or move focus.
     internal sealed class PasteTarget {
@@ -29,6 +55,7 @@ namespace SpaceDictation {
         [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint thread, ref GuiThreadInfo info);
         [DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
         [DllImport("user32.dll")] static extern uint SendInput(uint count, Input[] items, int size);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder name, int length);
         [DllImport("user32.dll")] internal static extern uint GetClipboardSequenceNumber();
 
         readonly IntPtr window, focus;
@@ -42,11 +69,23 @@ namespace SpaceDictation {
             uint thread = GetWindowThreadProcessId(window, IntPtr.Zero);
             return thread != 0 && GetGUIThreadInfo(thread, ref info) ? info.focus : IntPtr.Zero;
         }
-        static int[] FocusedEditor() {
+        static bool ChromiumWindow(IntPtr window) {
+            var name = new StringBuilder(64);
+            GetClassName(window, name, name.Capacity);
+            return name.ToString().StartsWith("Chrome_WidgetWin_", StringComparison.Ordinal);
+        }
+        static int[] FocusedEditor(bool chromium) {
             var element = AutomationElement.FocusedElement;
             if (element == null) return null;
             var state = element.Current;
-            if (state.IsPassword || !state.IsEnabled || !state.HasKeyboardFocus) return null;
+            if (state.IsPassword || !state.IsEnabled) return null;
+            // Electron can expose the renderer document instead of its contenteditable.
+            // A document identity alone is insufficient. The input guard also rejects
+            // any intervening click, scroll or non-space key before paste.
+            if (chromium &&
+                (state.ControlType == ControlType.Document || state.ControlType == ControlType.Pane))
+                return element.GetRuntimeId();
+            if (!state.HasKeyboardFocus) return null;
             object pattern;
             if (element.TryGetCurrentPattern(ValuePattern.Pattern, out pattern)) {
                 if (((ValuePattern)pattern).Current.IsReadOnly) return null;
@@ -63,7 +102,7 @@ namespace SpaceDictation {
             return Task.Run(delegate {
                 try {
                     if (focus == IntPtr.Zero || FocusOf(window) != focus) return null;
-                    var id = FocusedEditor();
+                    var id = FocusedEditor(ChromiumWindow(window));
                     return id != null && id.Length > 0 && FocusOf(window) == focus ? new PasteTarget(window, focus, id) : null;
                 } catch (Exception) { return null; } // Some providers do not expose a focused editor.
             });
@@ -71,18 +110,24 @@ namespace SpaceDictation {
         static Input Key(ushort key, bool up) {
             return new Input { type = 1, data = new InputData { keyboard = new KeyboardInput { key = key, flags = up ? 2u : 0u } } };
         }
-        public static async Task<bool> PasteIfCurrent(Task<PasteTarget> capture, uint sequence) {
+        public static async Task<bool> PasteIfCurrent(Task<PasteTarget> capture, uint sequence, Func<bool> inputUnchanged = null, string expectedText = null) {
             if (capture == null || sequence == 0 || !capture.IsCompleted) return false;
             var target = await capture;
             if (target == null) return false;
             // Only the metadata lookup runs off the UI thread. A timed-out lookup can
             // never inject a late keystroke.
             var lookup = Task.Run(delegate {
-                try { return FocusOf(target.window) == target.focus && target.elementId.SequenceEqual(FocusedEditor() ?? new int[0]); }
+                try { return FocusOf(target.window) == target.focus && target.elementId.SequenceEqual(FocusedEditor(ChromiumWindow(target.window)) ?? new int[0]); }
                 catch (Exception) { return false; }
             });
-            if (await Task.WhenAny(lookup, Task.Delay(800)) != lookup || !await lookup) return false;
-            if (FocusOf(target.window) != target.focus || GetClipboardSequenceNumber() != sequence) return false;
+            if (await Task.WhenAny(lookup, Task.Delay(1600)) != lookup || !await lookup) return false;
+            if (inputUnchanged != null && !inputUnchanged()) return false;
+            if (GetClipboardSequenceNumber() != sequence) {
+                // Clipboard managers can republish the same Unicode text during the focus check.
+                try { if (expectedText == null || System.Windows.Forms.Clipboard.GetText() != expectedText) return false; }
+                catch (System.Runtime.InteropServices.ExternalException) { return false; }
+            }
+            if (FocusOf(target.window) != target.focus) return false;
             foreach (int key in new[] { 0x10, 0x11, 0x12, 0x5b, 0x5c, 0x56 })
                 if (GetAsyncKeyState(key) < 0) return false;
             var chord = new[] { Key(0x11, false), Key(0x56, false), Key(0x56, true), Key(0x11, true) };

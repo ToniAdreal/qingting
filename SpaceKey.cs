@@ -18,14 +18,16 @@ namespace SpaceDictation {
         readonly KeyboardProc callback;
         readonly Func<bool> enabled;
         readonly Action start, stop;
+        readonly Action otherKey;
         readonly Action<byte, byte, uint, UIntPtr> emit;
         readonly Timer threshold = new Timer { Interval = 340 };
         IntPtr hook, origin;
         enum Press { Up, Native, Pending, Held, Consumed }
         Press press;
 
-        public SpaceKey(Func<bool> enabled, Action start, Action stop, Action<byte, byte, uint, UIntPtr> emit = null) {
+        public SpaceKey(Func<bool> enabled, Action start, Action stop, Action<byte, byte, uint, UIntPtr> emit = null, Action otherKey = null) {
             this.enabled = enabled; this.start = start; this.stop = stop;
+            this.otherKey = otherKey;
             this.emit = emit ?? keybd_event;
             threshold.Tick += delegate {
                 threshold.Stop();
@@ -51,6 +53,7 @@ namespace SpaceDictation {
                 var data = (KeyData)Marshal.PtrToStructure(pointer, typeof(KeyData));
                 bool down = (data.flags & 0x80) == 0;
                 if ((data.flags & 0x10) == 0) {
+                    if (down && data.key != Space && otherKey != null) otherKey();
                     if (data.key == Space) {
                         if (down && press == Press.Up) {
                             press = enabled() && !Modified() ? Press.Pending : Press.Native;

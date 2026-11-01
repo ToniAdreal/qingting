@@ -28,6 +28,7 @@ namespace SpaceDictation {
         string title, hint, lastText = "", error = "";
         byte[] retryAudio;
         Task<PasteTarget> pasteTarget;
+        PasteGuard pasteGuard;
         Color accent;
         int strength;
         public Widget(Action<string> writeClipboard = null) {
@@ -45,7 +46,8 @@ namespace SpaceDictation {
             catch { prefs = new Preferences(); error = "旧设置无法读取，请重新填写并保存。"; }
             Shown += delegate {
                 try { hook = new SpaceKey(CanUseSpace, delegate { StartRecording(true); },
-                    delegate { BeginInvoke((Action)delegate { if (fromKey) FinishRecording(); }); }); }
+                    delegate { BeginInvoke((Action)delegate { if (fromKey) FinishRecording(); }); },
+                    otherKey: delegate { if (pasteGuard != null) pasteGuard.Cancel(); }); }
                 catch { error = "Windows 未能启用全局空格，可点击悬浮窗开始和结束录音。"; }
                 Idle();
             };
@@ -56,7 +58,7 @@ namespace SpaceDictation {
                     hint = recordingTime.Elapsed.ToString(@"mm\:ss") + (fromKey ? "   松开空格完成" : "   再点一次完成");
                     if (recordingTime.Elapsed.TotalMinutes >= 5) FinishRecording();
                     Invalidate();
-                } catch (Exception ex) { DropRecorder(); Fail(ex.Message); }
+                } catch (Exception ex) { EndPasteWatch(); DropRecorder(); Fail(ex.Message); }
             };
             menu.Opening += delegate {
                 menu.Items.Clear();
@@ -157,12 +159,19 @@ namespace SpaceDictation {
         void StartRecording(bool keyboard) {
             if (busy || recorder != null || settingsOpen || !Ready || closing) return;
             try {
+                EndPasteWatch();
+                if (keyboard && prefs.AutoPaste) pasteGuard = new PasteGuard();
                 pasteTarget = keyboard && prefs.AutoPaste ? PasteTarget.Capture() : null;
                 recorder = new Recorder(prefs.Device);
                 retryAudio = null; error = ""; fromKey = keyboard;
                 State("正在聆听", keyboard ? "松开空格完成" : "再点一次完成", coral);
                 recordingTime.Restart(); pulse.Start();
-            } catch (Exception ex) { pasteTarget = null; Fail(ex.Message); }
+            } catch (Exception ex) { EndPasteWatch(); Fail(ex.Message); }
+        }
+        void EndPasteWatch() {
+            pasteTarget = null;
+            if (pasteGuard != null) pasteGuard.Dispose();
+            pasteGuard = null;
         }
         void DropRecorder() {
             pulse.Stop(); fromKey = false; strength = 0; recordingTime.Stop();
@@ -172,9 +181,9 @@ namespace SpaceDictation {
             if (recorder == null) return;
             byte[] audio;
             try { audio = recorder.Finish(); }
-            catch (Exception ex) { Fail(ex.Message); return; }
+            catch (Exception ex) { EndPasteWatch(); Fail(ex.Message); return; }
             finally { DropRecorder(); }
-            if (audio.Length < 44 + 3200) { State("录音太短", "请等到显示「正在聆听」再开口", coral); return; }
+            if (audio.Length < 44 + 3200) { EndPasteWatch(); State("录音太短", "请等到显示「正在聆听」再开口", coral); return; }
             Submit(audio);
         }
         async void Submit(byte[] audio) {
@@ -190,7 +199,7 @@ namespace SpaceDictation {
                 if (String.IsNullOrWhiteSpace(text)) { State("没有听清", "请检查麦克风，再说一次", coral); return; }
                 lastText = text;
                 if (CopyLast() && destination != null &&
-                    await PasteTarget.PasteIfCurrent(destination, PasteTarget.GetClipboardSequenceNumber()) && !closing)
+                    await PasteTarget.PasteIfCurrent(destination, PasteTarget.GetClipboardSequenceNumber(), () => pasteGuard != null && pasteGuard.Untouched, text) && !closing)
                     State("已复制   /   已触发粘贴", "检查输入框里的文字后发送", mint);
             } catch (UnauthorizedAccessException ex) {
                 if (!closing && prefs.UseLocal) Fail(ex.Message);
@@ -198,7 +207,7 @@ namespace SpaceDictation {
             } catch (TaskCanceledException) { if (!closing) Fail("连接超时。点击悬浮窗可重试这段录音。"); }
             catch (HttpRequestException) { if (!closing) Fail("无法连接豆包，请检查网络或代理。点击悬浮窗重试。"); }
             catch (Exception ex) { if (!closing) Fail(ex.Message); }
-            finally { busy = false; }
+            finally { EndPasteWatch(); busy = false; }
         }
         bool CopyLast() {
             try {
@@ -212,7 +221,7 @@ namespace SpaceDictation {
             }
         }
         protected override void OnFormClosed(FormClosedEventArgs e) {
-            closing = true; if (hook != null) hook.Dispose(); DropRecorder(); pulse.Dispose(); local.Dispose();
+            closing = true; EndPasteWatch(); if (hook != null) hook.Dispose(); DropRecorder(); pulse.Dispose(); local.Dispose();
             menu.Dispose(); heading.Dispose(); caption.Dispose(); base.OnFormClosed(e);
         }
     }
